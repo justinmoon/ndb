@@ -1,0 +1,4 @@
+[submodule "nostrdb"]
+	path = nostrdb
+	url = git@github.com:justinmoon/nostrdb.git
+	branch = megalith
