@@ -1,8 +1,10 @@
 const std = @import("std");
+const json = std.json;
+const json_utils = @import("json_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const json = std.json;
 
+/// Errors that can occur while parsing nostr events from JSON.
 pub const ParseError = error{
     OutOfMemory,
     InvalidJson,
@@ -12,6 +14,7 @@ pub const ParseError = error{
     InvalidFieldType,
 };
 
+/// Parsed representation of a nostr tag array.
 pub const Tag = struct {
     values: []([]const u8),
 
@@ -21,7 +24,8 @@ pub const Tag = struct {
     }
 };
 
-pub const Event = struct {
+/// Canonical representation of a nostr event payload.
+pub const NostrEvent = struct {
     id: []const u8,
     pubkey: []const u8,
     created_at: i64,
@@ -30,7 +34,7 @@ pub const Event = struct {
     content: []const u8,
     sig: []const u8,
 
-    pub fn deinit(self: *Event, allocator: Allocator) void {
+    pub fn deinit(self: *NostrEvent, allocator: Allocator) void {
         allocator.free(self.id);
         allocator.free(self.pubkey);
         allocator.free(self.content);
@@ -39,7 +43,7 @@ pub const Event = struct {
         allocator.free(self.tags);
     }
 
-    pub fn eql(a: Event, b: Event) bool {
+    pub fn eql(a: NostrEvent, b: NostrEvent) bool {
         if (!std.mem.eql(u8, a.id, b.id)) return false;
         if (!std.mem.eql(u8, a.pubkey, b.pubkey)) return false;
         if (a.created_at != b.created_at) return false;
@@ -57,68 +61,69 @@ pub const Event = struct {
     }
 };
 
-pub const EventMessage = struct {
-    subscription: []const u8,
-    event: Event,
+/// Envelope for an EVENT message received from a relay.
+pub const NostrEventMessage = struct {
+    subscription_id: []const u8,
+    event: NostrEvent,
 
-    pub fn deinit(self: *EventMessage, allocator: Allocator) void {
-        allocator.free(self.subscription);
+    pub fn deinit(self: *NostrEventMessage, allocator: Allocator) void {
+        allocator.free(self.subscription_id);
         self.event.deinit(allocator);
     }
 };
 
-pub fn parseEventMessage(allocator: Allocator, raw: []const u8) ParseError!EventMessage {
+/// Parse a raw relay EVENT message JSON payload.
+pub fn parseEventMessage(allocator: Allocator, raw: []const u8) ParseError!NostrEventMessage {
     var parsed = json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always }) catch {
         return ParseError.InvalidJson;
     };
     defer parsed.deinit();
 
-    const root = parsed.value;
-    const array_value = switch (root) {
+    const array_value = switch (parsed.value) {
         .array => |arr| arr,
         else => return ParseError.InvalidMessageFormat,
     };
     const items = array_value.items;
     if (items.len < 3) return ParseError.InvalidMessageFormat;
 
-    const typ_str = switch (items[0]) {
+    const message_type = switch (items[0]) {
         .string => |s| s,
         else => return ParseError.InvalidMessageFormat,
     };
-    if (!std.mem.eql(u8, typ_str, "EVENT")) return ParseError.InvalidMessageType;
+    if (!std.mem.eql(u8, message_type, "EVENT")) return ParseError.InvalidMessageType;
 
-    const sub_str = switch (items[1]) {
+    const subscription_id = switch (items[1]) {
         .string => |s| s,
         else => return ParseError.InvalidFieldType,
     };
 
-    var message = EventMessage{
-        .subscription = try allocator.dupe(u8, sub_str),
+    var message = NostrEventMessage{
+        .subscription_id = try allocator.dupe(u8, subscription_id),
         .event = undefined,
     };
     errdefer message.deinit(allocator);
 
     message.event = try parseEventValue(allocator, items[2]);
-
     return message;
 }
 
-pub fn formatEventMessage(allocator: Allocator, message: *const EventMessage) ![]u8 {
+/// Serialize a nostr EVENT message back to JSON.
+pub fn formatEventMessage(allocator: Allocator, message: *const NostrEventMessage) ![]u8 {
     var buffer = std.io.Writer.Allocating.init(allocator);
     defer buffer.deinit();
 
     var stringify = json.Stringify{ .options = .{}, .writer = &buffer.writer };
-
     try stringify.beginArray();
     try stringify.write("EVENT");
-    try stringify.write(message.subscription);
+    try stringify.write(message.subscription_id);
     try writeEventObject(&stringify, &message.event);
     try stringify.endArray();
 
     return try buffer.toOwnedSlice();
 }
 
-pub fn parseEventObject(allocator: Allocator, raw: []const u8) ParseError!Event {
+/// Parse a nostr event JSON object.
+pub fn parseEventObject(allocator: Allocator, raw: []const u8) ParseError!NostrEvent {
     var parsed = json.parseFromSlice(json.Value, allocator, raw, .{ .allocate = .alloc_always }) catch {
         return ParseError.InvalidJson;
     };
@@ -130,7 +135,8 @@ pub fn parseEventObject(allocator: Allocator, raw: []const u8) ParseError!Event 
     };
 }
 
-pub fn formatEventObject(allocator: Allocator, event: *const Event) ![]u8 {
+/// Serialize a nostr event object.
+pub fn formatEventObject(allocator: Allocator, event: *const NostrEvent) ![]u8 {
     var buffer = std.io.Writer.Allocating.init(allocator);
     defer buffer.deinit();
 
@@ -139,21 +145,21 @@ pub fn formatEventObject(allocator: Allocator, event: *const Event) ![]u8 {
     return try buffer.toOwnedSlice();
 }
 
-fn parseEventValue(allocator: Allocator, value: json.Value) ParseError!Event {
+fn parseEventValue(allocator: Allocator, value: json.Value) ParseError!NostrEvent {
     return switch (value) {
         .object => |*obj| parseEventFromObject(allocator, obj),
         else => ParseError.InvalidMessageFormat,
     };
 }
 
-fn parseEventFromObject(allocator: Allocator, obj: *const json.ObjectMap) ParseError!Event {
-    const id_slice = try expectString(obj, "id");
-    const pubkey_slice = try expectString(obj, "pubkey");
-    const content_slice = try expectString(obj, "content");
-    const sig_slice = try expectString(obj, "sig");
+fn parseEventFromObject(allocator: Allocator, obj: *const json.ObjectMap) ParseError!NostrEvent {
+    const id_slice = json_utils.expectString(obj, "id") catch |err| return mapFieldError(err);
+    const pubkey_slice = json_utils.expectString(obj, "pubkey") catch |err| return mapFieldError(err);
+    const content_slice = json_utils.expectString(obj, "content") catch |err| return mapFieldError(err);
+    const sig_slice = json_utils.expectString(obj, "sig") catch |err| return mapFieldError(err);
 
-    const created_at_val = try expectNumber(obj, "created_at");
-    const kind_val = try expectNumber(obj, "kind");
+    const created_at_val = json_utils.expectInteger(obj, "created_at") catch |err| return mapFieldError(err);
+    const kind_val = json_utils.expectInteger(obj, "kind") catch |err| return mapFieldError(err);
 
     const id_owned = try allocator.dupe(u8, id_slice);
     errdefer allocator.free(id_owned);
@@ -170,7 +176,7 @@ fn parseEventFromObject(allocator: Allocator, obj: *const json.ObjectMap) ParseE
         allocator.free(tags_owned);
     }
 
-    return Event{
+    return NostrEvent{
         .id = id_owned,
         .pubkey = pubkey_owned,
         .created_at = created_at_val,
@@ -178,24 +184,6 @@ fn parseEventFromObject(allocator: Allocator, obj: *const json.ObjectMap) ParseE
         .tags = tags_owned,
         .content = content_owned,
         .sig = sig_owned,
-    };
-}
-
-fn expectString(obj: *const json.ObjectMap, key: []const u8) ParseError![]const u8 {
-    const value = obj.*.get(key) orelse return ParseError.MissingField;
-    return switch (value) {
-        .string => |s| s,
-        else => ParseError.InvalidFieldType,
-    };
-}
-
-fn expectNumber(obj: *const json.ObjectMap, key: []const u8) ParseError!i64 {
-    const value = obj.*.get(key) orelse return ParseError.MissingField;
-    return switch (value) {
-        .integer => |i| i,
-        .float => |f| @as(i64, @intFromFloat(f)),
-        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch return ParseError.InvalidFieldType,
-        else => ParseError.InvalidFieldType,
     };
 }
 
@@ -241,7 +229,7 @@ fn parseTags(allocator: Allocator, obj: *const json.ObjectMap) ParseError![]Tag 
     return tags_slice;
 }
 
-fn writeEventObject(writer: *json.Stringify, event: *const Event) !void {
+fn writeEventObject(writer: *json.Stringify, event: *const NostrEvent) !void {
     try writer.beginObject();
     try writer.objectField("id");
     try writer.write(event.id);
@@ -266,4 +254,11 @@ fn writeEventObject(writer: *json.Stringify, event: *const Event) !void {
     try writer.objectField("sig");
     try writer.write(event.sig);
     try writer.endObject();
+}
+
+fn mapFieldError(err: json_utils.FieldError) ParseError {
+    return switch (err) {
+        error.MissingField => ParseError.MissingField,
+        error.InvalidFieldType => ParseError.InvalidFieldType,
+    };
 }

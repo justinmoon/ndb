@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Mutex = std.Thread.Mutex;
 const Condition = std.Thread.Condition;
 
+/// Simple mutex-protected FIFO queue used for command and event passing.
 fn ThreadQueue(comptime T: type) type {
     return struct {
         mutex: Mutex = .{},
@@ -45,11 +46,15 @@ fn ThreadQueue(comptime T: type) type {
     };
 }
 
+/// Parameters describing the filters to send with a REQ message.
 pub const SubscriptionSpec = struct {
-    id: []const u8,
+    /// Client-chosen subscription identifier echoed by the relay.
+    subscription_id: []const u8,
+    /// Pre-encoded JSON filters sent as part of the REQ.
     filters_json: []const u8,
 };
 
+/// Command payload for adding a relay connection.
 const AddRelayCommand = struct {
     url: []u8,
     subscriptions: []Subscription,
@@ -61,6 +66,7 @@ const AddRelayCommand = struct {
     }
 };
 
+/// Command payload for publishing an event across relays.
 const PublishCommand = struct {
     relays: [][]u8,
     payload: []u8,
@@ -72,12 +78,13 @@ const PublishCommand = struct {
     }
 };
 
-pub const Command = union(enum) {
+/// Commands consumed by the worker thread.
+pub const PoolCommand = union(enum) {
     add_relay: AddRelayCommand,
     publish: PublishCommand,
     shutdown,
 
-    pub fn deinit(self: *Command, allocator: Allocator) void {
+    pub fn deinit(self: *PoolCommand, allocator: Allocator) void {
         switch (self.*) {
             .add_relay => |*payload| payload.deinit(allocator),
             .publish => |*payload| payload.deinit(allocator),
@@ -86,24 +93,26 @@ pub const Command = union(enum) {
     }
 };
 
+/// Fully-owned subscription details queued to the worker.
 pub const Subscription = struct {
-    id: []u8,
+    subscription_id: []u8,
     filters_json: []u8,
 
     pub fn clone(spec: SubscriptionSpec, allocator: Allocator) !Subscription {
         return Subscription{
-            .id = try allocator.dupe(u8, spec.id),
+            .subscription_id = try allocator.dupe(u8, spec.subscription_id),
             .filters_json = try allocator.dupe(u8, spec.filters_json),
         };
     }
 
     pub fn deinit(self: *Subscription, allocator: Allocator) void {
-        allocator.free(self.id);
+        allocator.free(self.subscription_id);
         allocator.free(self.filters_json);
     }
 };
 
-pub const Event = union(enum) {
+/// Events emitted from the worker thread back to the caller.
+pub const PoolEvent = union(enum) {
     connected: struct { url: []u8 },
     received: struct { relay: []u8, payload: []u8 },
     eose: struct { relay: []u8, subscription: []u8 },
@@ -113,7 +122,7 @@ pub const Event = union(enum) {
     failure: struct { relay: []u8, message: []u8 },
     shutdown_complete,
 
-    pub fn deinit(self: *Event, allocator: Allocator) void {
+    pub fn deinit(self: *PoolEvent, allocator: Allocator) void {
         switch (self.*) {
             .connected => |payload| allocator.free(payload.url),
             .received => |payload| {
@@ -146,23 +155,24 @@ pub const Event = union(enum) {
     }
 };
 
+/// High-level relay pool that manages websocket clients on a worker thread.
 pub const RelayPool = struct {
     allocator: Allocator,
-    commands: *ThreadQueue(Command),
-    events: *ThreadQueue(Event),
+    commands: *ThreadQueue(PoolCommand),
+    events: *ThreadQueue(PoolEvent),
     worker_state: *WorkerState,
     worker: std.Thread,
 
     const Self = @This();
 
     pub fn init(allocator: Allocator) !Self {
-        const commands_ptr = try allocator.create(ThreadQueue(Command));
+        const commands_ptr = try allocator.create(ThreadQueue(PoolCommand));
         errdefer allocator.destroy(commands_ptr);
-        commands_ptr.* = ThreadQueue(Command).init(allocator);
+        commands_ptr.* = ThreadQueue(PoolCommand).init(allocator);
 
-        const events_ptr = try allocator.create(ThreadQueue(Event));
+        const events_ptr = try allocator.create(ThreadQueue(PoolEvent));
         errdefer allocator.destroy(events_ptr);
-        events_ptr.* = ThreadQueue(Event).init(allocator);
+        events_ptr.* = ThreadQueue(PoolEvent).init(allocator);
 
         const worker_state = try allocator.create(WorkerState);
         errdefer allocator.destroy(worker_state);
@@ -185,7 +195,7 @@ pub const RelayPool = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        const cmd = Command{ .shutdown = void{} };
+        const cmd = PoolCommand{ .shutdown = void{} };
         self.commands.push(cmd) catch {};
         self.worker.join();
         self.worker_state.deinit();
@@ -202,7 +212,7 @@ pub const RelayPool = struct {
         for (subscriptions, 0..) |spec, idx| {
             owned_subs[idx] = try Subscription.clone(spec, self.allocator);
         }
-        const command = Command{ .add_relay = .{ .url = owned_url, .subscriptions = owned_subs } };
+        const command = PoolCommand{ .add_relay = .{ .url = owned_url, .subscriptions = owned_subs } };
         try self.commands.push(command);
     }
 
@@ -212,30 +222,31 @@ pub const RelayPool = struct {
             owned_relays[idx] = try self.allocator.dupe(u8, relay);
         }
         const owned_payload = try self.allocator.dupe(u8, payload);
-        const command = Command{ .publish = .{ .relays = owned_relays, .payload = owned_payload } };
+        const command = PoolCommand{ .publish = .{ .relays = owned_relays, .payload = owned_payload } };
         try self.commands.push(command);
     }
 
-    pub fn pollEvent(self: *Self) ?Event {
+    pub fn pollEvent(self: *Self) ?PoolEvent {
         return self.events.pop();
     }
 
-    pub fn waitEvent(self: *Self) Event {
+    pub fn waitEvent(self: *Self) PoolEvent {
         return self.events.wait();
     }
 };
 
+/// Shared state owned by the worker thread.
 const WorkerState = struct {
     allocator: Allocator,
-    commands: *ThreadQueue(Command),
-    events: *ThreadQueue(Event),
+    commands: *ThreadQueue(PoolCommand),
+    events: *ThreadQueue(PoolEvent),
     running: bool = true,
 
     fn deinit(self: *WorkerState) void {
         _ = self;
     }
 
-    fn pushEvent(self: *WorkerState, event: Event) void {
+    fn pushEvent(self: *WorkerState, event: PoolEvent) void {
         self.events.push(event) catch {
             var tmp = event;
             tmp.deinit(self.allocator);
@@ -272,7 +283,7 @@ const WorkerState = struct {
             std.Thread.sleep(5 * std.time.ns_per_ms);
         }
 
-        self.pushEvent(Event{ .shutdown_complete = {} });
+        self.pushEvent(PoolEvent{ .shutdown_complete = {} });
     }
 
     fn reportError(self: *WorkerState, message: []const u8) void {
@@ -281,8 +292,7 @@ const WorkerState = struct {
             self.allocator.free(relay);
             return;
         };
-        const event = Event{ .failure = .{ .relay = relay, .message = msg } };
-        self.pushEvent(event);
+        self.pushEvent(PoolEvent{ .failure = .{ .relay = relay, .message = msg } });
     }
 
     fn handleAddRelay(self: *WorkerState, clients: *std.StringHashMap(*ClientState), payload: AddRelayCommand) !void {
@@ -292,7 +302,7 @@ const WorkerState = struct {
         if (clients.get(norm)) |client_ptr| {
             try self.sendSubscriptions(client_ptr, payload.subscriptions);
             const url_copy = try dup(self.allocator, client_ptr.url);
-            self.pushEvent(Event{ .connected = .{ .url = url_copy } });
+            self.pushEvent(PoolEvent{ .connected = .{ .url = url_copy } });
             return;
         }
 
@@ -330,7 +340,7 @@ const WorkerState = struct {
         try clients.put(norm, client_state);
         try self.sendSubscriptions(client_state, payload.subscriptions);
         const url_copy = try dup(self.allocator, client_state.url);
-        self.pushEvent(Event{ .connected = .{ .url = url_copy } });
+        self.pushEvent(PoolEvent{ .connected = .{ .url = url_copy } });
     }
 
     fn handlePublish(self: *WorkerState, clients: *std.StringHashMap(*ClientState), payload: PublishCommand) !void {
@@ -344,7 +354,7 @@ const WorkerState = struct {
             } else {
                 const relay_copy = try dup(self.allocator, relay);
                 const msg_copy = try dup(self.allocator, "relay not connected");
-                self.pushEvent(Event{ .failure = .{ .relay = relay_copy, .message = msg_copy } });
+                self.pushEvent(PoolEvent{ .failure = .{ .relay = relay_copy, .message = msg_copy } });
             }
         }
     }
@@ -362,7 +372,7 @@ const WorkerState = struct {
                 error.Closed, error.ConnectionResetByPeer => {
                     const url_copy = try dup(self.allocator, client_state.url);
                     const reason_copy = try dup(self.allocator, @errorName(err));
-                    self.pushEvent(Event{ .disconnect = .{ .url = url_copy, .reason = reason_copy } });
+                    self.pushEvent(PoolEvent{ .disconnect = .{ .url = url_copy, .reason = reason_copy } });
                     cleanupClient(self.allocator, client_state);
                     try removals.append(self.allocator, key);
                 },
@@ -374,7 +384,7 @@ const WorkerState = struct {
                         try dup(self.allocator, "client error")
                     else
                         try dup(self.allocator, text);
-                    self.pushEvent(Event{ .failure = .{ .relay = relay_copy, .message = msg_copy } });
+                    self.pushEvent(PoolEvent{ .failure = .{ .relay = relay_copy, .message = msg_copy } });
                 },
             };
         }
@@ -386,13 +396,14 @@ const WorkerState = struct {
 
     fn sendSubscriptions(self: *WorkerState, client_state: *ClientState, subscriptions: []Subscription) !void {
         for (subscriptions) |sub| {
-            const message = try std.fmt.allocPrint(self.allocator, "[\"REQ\",\"{s}\",{s}]", .{ sub.id, sub.filters_json });
+            const message = try std.fmt.allocPrint(self.allocator, "[\"REQ\",\"{s}\",{s}]", .{ sub.subscription_id, sub.filters_json });
             defer self.allocator.free(message);
             try sendMutable(&client_state.client, message, self.allocator);
         }
     }
 };
 
+/// Internal representation of an active websocket relay connection.
 const ClientState = struct {
     url: []u8,
     host: []u8,
@@ -437,89 +448,82 @@ fn handleTextFrame(state: *WorkerState, client_state: *ClientState, data: []u8) 
     if (std.mem.startsWith(u8, trimmed, "[\"EVENT\"")) {
         const relay_copy = try dup(state.allocator, client_state.url);
         const payload_copy = try dup(state.allocator, trimmed);
-        state.pushEvent(Event{ .received = .{ .relay = relay_copy, .payload = payload_copy } });
+        state.pushEvent(PoolEvent{ .received = .{ .relay = relay_copy, .payload = payload_copy } });
         return;
     }
 
     if (std.mem.startsWith(u8, trimmed, "[\"EOSE\"")) {
-        if (try extractQuoted(state.allocator, trimmed, 2)) |parts| {
-            defer freeParts(state.allocator, parts);
-            if (parts.len >= 2) {
-                const relay_copy = try dup(state.allocator, client_state.url);
-                const sub_copy = try dup(state.allocator, parts[1]);
-                state.pushEvent(Event{ .eose = .{ .relay = relay_copy, .subscription = sub_copy } });
-            }
-        }
+        const relay_copy = try dup(state.allocator, client_state.url);
+        const sub_copy = extractQuotedValue(state.allocator, trimmed, 1) catch |err| switch (err) {
+            error.NotFound => {
+                const msg_copy = try dup(state.allocator, "malformed EOSE");
+                state.pushEvent(PoolEvent{ .notice = .{ .relay = relay_copy, .message = msg_copy } });
+                return;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        state.pushEvent(PoolEvent{ .eose = .{ .relay = relay_copy, .subscription = sub_copy } });
         return;
     }
 
     if (std.mem.startsWith(u8, trimmed, "[\"NOTICE\"")) {
         const relay_copy = try dup(state.allocator, client_state.url);
         const msg_copy = try dup(state.allocator, trimmed);
-        state.pushEvent(Event{ .notice = .{ .relay = relay_copy, .message = msg_copy } });
+        state.pushEvent(PoolEvent{ .notice = .{ .relay = relay_copy, .message = msg_copy } });
         return;
     }
 
     if (std.mem.startsWith(u8, trimmed, "[\"OK\"")) {
-        if (try extractQuoted(state.allocator, trimmed, 4)) |parts| {
-            defer freeParts(state.allocator, parts);
-            if (parts.len >= 4) {
-                const accepted = std.mem.eql(u8, parts[2], "true");
-                const relay_copy = try dup(state.allocator, client_state.url);
-                const id_copy = try dup(state.allocator, parts[1]);
-                const msg_copy = try dup(state.allocator, parts[3]);
-                state.pushEvent(Event{ .publish_ack = .{
-                    .relay = relay_copy,
-                    .event_id = id_copy,
-                    .accepted = accepted,
-                    .message = msg_copy,
-                } });
-            }
-        }
+        const relay_copy = try dup(state.allocator, client_state.url);
+        const event_id = extractQuotedValue(state.allocator, trimmed, 1) catch |err| switch (err) {
+            error.NotFound => {
+                const msg_copy = try dup(state.allocator, "malformed OK message");
+                state.pushEvent(PoolEvent{ .notice = .{ .relay = relay_copy, .message = msg_copy } });
+                return;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const message_value = extractQuotedValue(state.allocator, trimmed, 3) catch |err| switch (err) {
+            error.NotFound => try dup(state.allocator, ""),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const accepted = std.mem.indexOf(u8, trimmed, ",true") != null;
+        state.pushEvent(PoolEvent{ .publish_ack = .{
+            .relay = relay_copy,
+            .event_id = event_id,
+            .accepted = accepted,
+            .message = message_value,
+        } });
         return;
     }
 
-    // Unknown frame, surface as notice for visibility.
     const relay_copy = try dup(state.allocator, client_state.url);
     const msg_copy = try dup(state.allocator, trimmed);
-    state.pushEvent(Event{ .notice = .{ .relay = relay_copy, .message = msg_copy } });
+    state.pushEvent(PoolEvent{ .notice = .{ .relay = relay_copy, .message = msg_copy } });
 }
 
-fn extractQuoted(allocator: Allocator, data: []const u8, max_items: usize) !?[][]u8 {
-    var results = try allocator.alloc([]u8, max_items);
-    errdefer allocator.free(results);
-
+fn extractQuotedValue(allocator: Allocator, data: []const u8, index: usize) error{ NotFound, OutOfMemory }![]u8 {
     var count: usize = 0;
     var i: usize = 0;
-    while (i < data.len and count < max_items) : (i += 1) {
+    while (i < data.len) : (i += 1) {
         if (data[i] == '"') {
             const start = i + 1;
             i += 1;
             while (i < data.len and data[i] != '"') : (i += 1) {}
-            if (i <= data.len) {
-                results[count] = try allocator.dupe(u8, data[start..i]);
-                count += 1;
+            if (count == index) {
+                return allocator.dupe(u8, data[start..i]);
             }
+            count += 1;
         }
     }
-
-    if (count == 0) {
-        allocator.free(results);
-        return null;
-    }
-
-    return results[0..count];
-}
-
-fn freeParts(allocator: Allocator, parts: [][]u8) void {
-    for (parts) |part| allocator.free(part);
-    allocator.free(parts);
+    return error.NotFound;
 }
 
 fn dup(allocator: Allocator, slice: []const u8) ![]u8 {
     return allocator.dupe(u8, slice);
 }
 
+/// Parsed components from a websocket URL.
 const ParsedUrl = struct {
     host: []u8,
     path: []u8,
@@ -535,7 +539,6 @@ const ParsedUrl = struct {
 fn parseUrl(allocator: Allocator, url: []const u8) !ParsedUrl {
     const ws_prefix = "ws://";
     const wss_prefix = "wss://";
-
     var rest: []const u8 = undefined;
     var use_tls = false;
     if (std.mem.startsWith(u8, url, ws_prefix)) {
@@ -592,8 +595,4 @@ fn workerMain(state: *WorkerState) void {
     state.run() catch |err| {
         state.reportError(@errorName(err));
     };
-}
-
-pub fn normalizeRelayUrl(allocator: Allocator, url: []const u8) ![]u8 {
-    return normalizeUrl(allocator, url);
 }

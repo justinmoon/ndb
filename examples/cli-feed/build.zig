@@ -27,9 +27,13 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibrary(nostrdb_dep.artifact("nostrdb-zig"));
 
+    const validate_docs = b.addSystemCommand(&.{ "zig", "run", "tools/validate_doc_comments.zig" });
+    exe.step.dependOn(&validate_docs.step);
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(&validate_docs.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }

@@ -3,6 +3,7 @@ const ndb = @import("nostrdb");
 const relay_pool = @import("pool.zig");
 const nostr = @import("nostr.zig");
 
+/// Owns the temporary LMDB instance used for verification.
 const DbContext = struct {
     tmp: std.testing.TmpDir,
     path: []u8,
@@ -40,7 +41,7 @@ fn shutdownDb(allocator: std.mem.Allocator, ctx: *DbContext) void {
     ctx.tmp.cleanup();
 }
 
-fn handleEvent(ctx: *DbContext, allocator: std.mem.Allocator, event: *relay_pool.Event) void {
+fn handleEvent(ctx: *DbContext, allocator: std.mem.Allocator, event: *relay_pool.PoolEvent) void {
     switch (event.*) {
         .connected => |payload| {
             std.debug.print("connected to {s}\n", .{payload.url});
@@ -163,7 +164,7 @@ pub fn main() !void {
     };
 
     const filters_json = "{\"kinds\":[1],\"limit\":200}";
-    const subscription = relay_pool.SubscriptionSpec{ .id = "cli-feed", .filters_json = filters_json };
+    const subscription = relay_pool.SubscriptionSpec{ .subscription_id = "cli-feed", .filters_json = filters_json };
 
     for (relays) |relay_url| {
         try pool.addRelay(relay_url, &.{subscription});
