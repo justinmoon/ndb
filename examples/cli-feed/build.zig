@@ -2,9 +2,13 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Build optimization mode") orelse .ReleaseFast;
 
     const nostrdb_dep = b.dependency("nostrdb", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const websocket_dep = b.dependency("websocket", .{
         .target = target,
         .optimize = optimize,
     });
@@ -15,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_module.addImport("nostrdb", nostrdb_dep.module("nostrdb"));
+    exe_module.addImport("websocket", websocket_dep.module("websocket"));
 
     const exe = b.addExecutable(.{
         .name = "cli-feed",
