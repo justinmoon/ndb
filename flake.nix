@@ -14,41 +14,42 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        zigPkg = zig.packages.${system}."0.12.1";
-        baseInputs = with pkgs; [
+        inherit (pkgs) lib stdenv;
+        zigPkg = zig.packages.${system}."0.15.1";
+        devInputs = with pkgs; [
           zigPkg
-          git
           pkg-config
-        ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-          clang
-        ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          lmdb
+          secp256k1
+          gnumake
+          cmake
+          git
+        ] ++ lib.optionals stdenv.isLinux [
           gcc
+        ] ++ lib.optionals stdenv.isDarwin [
+          clang
         ];
-      in
-      {
+      in {
         devShells.default = pkgs.mkShell {
-          buildInputs = baseInputs;
+          buildInputs = devInputs;
           shellHook = ''
             export ZIG_GLOBAL_CACHE_DIR=$(pwd)/.zig-cache
             export ZIG_LOCAL_CACHE_DIR=$ZIG_GLOBAL_CACHE_DIR
-            echo "nostrdb-zig dev shell"
-            echo "Commands:"
-            echo "  zig build         # build static library"
-            echo "  zig build test    # run wrapper tests"
+            export PATH="${zigPkg}/bin:$PATH"
+            if [ -n "''${NIX_CFLAGS_COMPILE-}" ]; then
+              filtered_flags=""
+              for flag in $NIX_CFLAGS_COMPILE; do
+                case "$flag" in
+                  -fmacro-prefix-map=*) ;;
+                  *) filtered_flags="$filtered_flags $flag" ;;
+                esac
+              done
+              NIX_CFLAGS_COMPILE="''${filtered_flags# }"
+              export NIX_CFLAGS_COMPILE
+            fi
+            git submodule update --init --recursive
+            echo "nostrdb-zig with Zig ${zigPkg.version}"
           '';
-        };
-
-        apps.test = {
-          type = "app";
-          program = pkgs.writeShellApplication {
-            name = "run-nostrdb-zig-tests";
-            runtimeInputs = baseInputs;
-            text = ''
-              set -euo pipefail
-              git submodule update --init --recursive
-              zig build test
-            '';
-          };
         };
       }
     );
